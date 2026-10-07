@@ -206,6 +206,26 @@ def main() -> int:
     transcripts = {}
     pristine_encoded = {}
     paths = [str(p) for p in a.clips]
+
+    # Capture exactly what the encoder sees inside NeMo's own transcribe()
+    captured = []
+
+    def _hook(module, inputs, kwargs, output):
+        sig = kwargs.get("audio_signal", inputs[0] if inputs else None)
+        ln = kwargs.get("length", inputs[1] if len(inputs) > 1 else None)
+        captured.append((sig.detach().clone(), ln.detach().clone(), output[0].detach().clone(), output[1].detach().clone()))
+
+    handle = model.encoder.register_forward_hook(_hook, with_kwargs=True)
+    pre = model.preprocessor.featurizer
+    print(f"[diag] preprocessor before transcribe: dither={pre.dither} pad_to={pre.pad_to} "
+          f"normalize={getattr(pre, 'normalize', None)} training={model.training}")
+    hyps = model.transcribe(paths, batch_size=1, return_hypotheses=True, language_id="ne")
+    handle.remove()
+    if isinstance(hyps, tuple):
+        hyps = hyps[0]
+    print(f"[diag] preprocessor after transcribe: dither={pre.dither} pad_to={pre.pad_to}")
+    nemo_ids = {Path(pth).stem: [int(x) for x in getattr(h, "y_sequence", [])] for pth, h in zip(paths, hyps)}
+    transcribe_encoder_io = {Path(pth).stem: cap for pth, cap in zip(paths, captured)}
     raw = model.transcribe(paths, batch_size=1, logprobs=False, language_id="ne")
     if isinstance(raw, tuple):
         raw = raw[0]
@@ -226,6 +246,21 @@ def main() -> int:
     (ref / "transcripts.json").write_text(json.dumps(transcripts, indent=2, ensure_ascii=False))
 
     diagnostics = torch_diagnostics(model, kriti, tokens, paths, transcripts, pristine_encoded)
+    for stem, (sig, ln, enc_out, enc_len) in transcribe_encoder_io.items():
+        ours = np.load(ref / f"{stem}.feats.npy")
+        theirs = sig[0, :, : int(ln[0])].numpy()
+        n = min(ours.shape[1], theirs.shape[1])
+        their_enc = enc_out[0, :, : int(enc_len[0])].numpy()
+        m = min(their_enc.shape[1], pristine_encoded[stem].shape[1])
+        diagnostics["clips"][stem].update({
+            "transcribe_input_shape": list(sig.shape),
+            "transcribe_input_len": int(ln[0]),
+            "our_feats_len": int(ours.shape[1]),
+            "feats_vs_transcribe_input_max_abs_diff": float(np.abs(ours[:, :n] - theirs[:, :n]).max()),
+            "encoder_vs_transcribe_encoder_max_abs_diff": float(np.abs(pristine_encoded[stem][:, :m] - their_enc[:, :m]).max()),
+            "nemo_token_ids_head": nemo_ids.get(stem, [])[:20],
+            "nemo_ids_max": max(nemo_ids.get(stem, [0]) or [0]),
+        })
     print(json.dumps({"diagnostics_before_export": diagnostics}, indent=2, ensure_ascii=False))
 
     dims = export_graphs(model, out)
