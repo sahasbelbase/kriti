@@ -1,0 +1,87 @@
+name: Export ONNX model
+
+# Converts the released Kriti checkpoint (harrrshall/kriti, MIT) to ONNX, verifies the ONNX runtime
+# reproduces the original NeMo transcripts, and publishes the result as a release of this fork.
+# Used by the Just Talk desktop app, which runs ONNX Runtime without NeMo or PyTorch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish"
+        required: true
+        default: "onnx-v1"
+      publish:
+        description: "Publish a release if parity passes"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Kriti runtime (pinned AI4Bharat NeMo fork) and export tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y libsndfile1 ffmpeg
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e '.[runtime]'
+          pip install onnx onnxscript "onnxruntime>=1.17"
+          python -c "import nemo, torch, onnxruntime; print('NeMo', nemo.__version__, 'torch', torch.__version__, 'ort', onnxruntime.__version__)"
+
+      - name: Download released Kriti checkpoint
+        run: |
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          for f in ("kriti.nemo", "punctuation_head.json"):
+              print(hf_hub_download("harrrshall/kriti", f, local_dir="ckpt"))
+          PY
+          ls -la ckpt
+
+      - name: Prepare public test clips (16 kHz mono)
+        run: |
+          mkdir -p raw clips
+          for f in fleurs_ne_np_test_1749 fleurs_ne_np_test_1900 neptel_s02_seg_0003 neptel_s02_seg_0017 neptel_s03_seg_0001 neptel_s03_seg_0014; do
+            curl -sfL -o "raw/$f.wav" "https://huggingface.co/spaces/voidash/nepaliconformer/resolve/main/examples/$f.wav"
+            ffmpeg -loglevel error -y -i "raw/$f.wav" -ar 16000 -ac 1 -c:a pcm_s16le "clips/$f.wav"
+          done
+          ls -la clips
+
+      - name: Export to ONNX and check parity with NeMo
+        run: python export/export_onnx.py --model ckpt/kriti.nemo --head ckpt/punctuation_head.json --out dist clips/*.wav
+
+      - name: Keep reference data as a build artifact (not in the release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: kriti-onnx-reference
+          path: dist/reference
+          retention-days: 30
+
+      - name: Package release
+        run: |
+          rm -rf dist/reference
+          cp export/MODEL_CARD.md dist/README.md
+          cp export/kriti_onnx.py dist/
+          cp LICENSE dist/LICENSE.txt
+          cp NOTICE dist/NOTICE.txt
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          ls -la dist
+
+      - name: Publish release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" dist/* \
+            --title "Kriti — ONNX (${{ inputs.tag }})" \
+            --notes-file export/MODEL_CARD.md
