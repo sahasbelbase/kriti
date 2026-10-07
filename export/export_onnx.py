@@ -157,7 +157,9 @@ def quantize(out: Path) -> None:
     from onnxruntime.quantization import QuantType, quantize_dynamic
 
     for name in ("encoder", "decoder", "joint"):
-        quantize_dynamic(str(out / f"{name}.onnx"), str(out / f"{name}.int8.onnx"), weight_type=QuantType.QInt8)
+        # Per-channel scales keep accuracy far closer to fp32 than one scale per tensor
+        quantize_dynamic(str(out / f"{name}.onnx"), str(out / f"{name}.int8.onnx"),
+                         weight_type=QuantType.QInt8, per_channel=True)
         print(f"[export] {name}: {(out / f'{name}.onnx').stat().st_size >> 20} MB -> "
               f"{(out / f'{name}.int8.onnx').stat().st_size >> 20} MB int8")
 
@@ -168,6 +170,16 @@ def nepali_tokens(model) -> list[str]:
         tok = tok.tokenizers_dict["ne"]
     size = int(tok.vocab_size)
     return [tok.ids_to_tokens([i])[0] for i in range(size)]
+
+
+def word_error_rate(reference: str, hypothesis: str) -> float:
+    ref, hyp = reference.split(), hypothesis.split()
+    d = list(range(len(hyp) + 1))
+    for i, r in enumerate(ref, 1):
+        prev, d[0] = d[0], i
+        for j, h in enumerate(hyp, 1):
+            prev, d[j] = d[j], min(d[j] + 1, d[j - 1] + 1, prev + (r != h))
+    return d[len(hyp)] / max(1, len(ref))
 
 
 def main() -> int:
@@ -323,9 +335,11 @@ def main() -> int:
             a2 = rt.transcribe(np.load(ref / f"{stem}.audio.npy"))
             exact_nemo_feats += a1 == t["with_danda"]
             exact_numpy_feats += a2 == t["with_danda"]
-            samples[stem] = {"nemo": t["with_danda"], "onnx_nemo_feats": a1, "onnx_numpy_feats": a2}
+            samples[stem] = {"nemo": t["with_danda"], "onnx_nemo_feats": a1, "onnx_numpy_feats": a2,
+                             "wer_vs_nemo": round(word_error_rate(t["with_danda"], a2), 4)}
         parity["runs"][label] = {
             "clips": len(transcripts),
+            "mean_wer_vs_nemo": round(sum(s["wer_vs_nemo"] for s in samples.values()) / len(samples), 4),
             "exact_match_with_nemo_features": exact_nemo_feats,
             "exact_match_full_numpy_pipeline": exact_numpy_feats,
             "samples": samples,
