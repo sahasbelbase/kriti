@@ -211,6 +211,10 @@ def main() -> int:
     captured = []
 
     def _hook(module, inputs, kwargs, output):
+        print(f"[diag] encoder call in transcribe: kwargs={sorted(kwargs)} n_args={len(inputs)} "
+              f"autocast_cpu={torch.is_autocast_cpu_enabled()} autocast_dtype={torch.get_autocast_cpu_dtype()} "
+              f"out_dtype={output[0].dtype} any_submodule_training={any(m.training for m in module.modules())} "
+              f"grad={torch.is_grad_enabled()} inference_mode={torch.is_inference_mode_enabled()}")
         sig = kwargs.get("audio_signal", inputs[0] if inputs else None)
         ln = kwargs.get("length", inputs[1] if len(inputs) > 1 else None)
         captured.append((sig.detach().clone(), ln.detach().clone(), output[0].detach().clone(), output[1].detach().clone()))
@@ -241,6 +245,18 @@ def main() -> int:
         np.save(ref / f"{stem}.feats.npy", feats[0, :, : int(flen[0])].numpy().astype(np.float32))
         with torch.no_grad():
             enc, elen = model.encoder(audio_signal=feats, length=flen)
+            if stem == Path(paths[0]).stem:
+                print(f"[diag] direct encoder call: any_submodule_training={any(m.training for m in model.encoder.modules())} "
+                      f"autocast_cpu={torch.is_autocast_cpu_enabled()}")
+                sig, ln, t_enc, t_len = transcribe_encoder_io[stem]
+                print(f"[diag] same-input check: transcribe input == ours: {torch.equal(sig, feats)}; "
+                      f"dtypes {sig.dtype}/{feats.dtype}; shapes {tuple(sig.shape)}/{tuple(feats.shape)}")
+                again, _ = model.encoder(audio_signal=sig, length=ln)
+                print(f"[diag] re-running encoder on captured transcribe input: max diff vs transcribe output "
+                      f"{float((again - t_enc).abs().max()):.4f}")
+                with torch.autocast("cpu", dtype=torch.bfloat16):
+                    bf, _ = model.encoder(audio_signal=feats, length=flen)
+                print(f"[diag] bf16-autocast encoder vs transcribe output: {float((bf.float() - t_enc).abs().max()):.4f}")
         pristine_encoded[stem] = enc[0, :, : int(elen[0])].numpy().astype(np.float32)
         transcripts[stem] = {"rnnt": getattr(r, "text", r), "with_danda": f}
     (ref / "transcripts.json").write_text(json.dumps(transcripts, indent=2, ensure_ascii=False))
