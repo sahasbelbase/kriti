@@ -225,15 +225,20 @@ def main() -> int:
           f"normalize={getattr(pre, 'normalize', None)} training={model.training}")
     hyps = model.transcribe(paths, batch_size=1, return_hypotheses=True, language_id="ne")
     handle.remove()
+    # NeMo's transcribe() ends with unfreeze(), which puts modules back in *training* mode
+    # (dropout on). Every later direct call must re-enter eval mode or it is randomly perturbed.
+    model.eval()
     if isinstance(hyps, tuple):
         hyps = hyps[0]
     print(f"[diag] preprocessor after transcribe: dither={pre.dither} pad_to={pre.pad_to}")
     nemo_ids = {Path(pth).stem: [int(x) for x in getattr(h, "y_sequence", [])] for pth, h in zip(paths, hyps)}
     transcribe_encoder_io = {Path(pth).stem: cap for pth, cap in zip(paths, captured)}
     raw = model.transcribe(paths, batch_size=1, logprobs=False, language_id="ne")
+    model.eval()
     if isinstance(raw, tuple):
         raw = raw[0]
-    full = kriti.transcribe(paths, batch_size=1)
+    full = kriti.transcribe(paths, batch_size=1)  # computes danda features first, so eval mode matters
+    model.eval()
     for path, r, f in zip(paths, raw, full):
         stem = Path(path).stem
         audio, sr = sf.read(path, dtype="float32", always_2d=True)
@@ -244,19 +249,8 @@ def main() -> int:
                                              length=torch.tensor([len(audio)]))
         np.save(ref / f"{stem}.feats.npy", feats[0, :, : int(flen[0])].numpy().astype(np.float32))
         with torch.no_grad():
+            assert not any(m.training for m in model.encoder.modules()), "encoder must be in eval mode"
             enc, elen = model.encoder(audio_signal=feats, length=flen)
-            if stem == Path(paths[0]).stem:
-                print(f"[diag] direct encoder call: any_submodule_training={any(m.training for m in model.encoder.modules())} "
-                      f"autocast_cpu={torch.is_autocast_cpu_enabled()}")
-                sig, ln, t_enc, t_len = transcribe_encoder_io[stem]
-                print(f"[diag] same-input check: transcribe input == ours: {torch.equal(sig, feats)}; "
-                      f"dtypes {sig.dtype}/{feats.dtype}; shapes {tuple(sig.shape)}/{tuple(feats.shape)}")
-                again, _ = model.encoder(audio_signal=sig, length=ln)
-                print(f"[diag] re-running encoder on captured transcribe input: max diff vs transcribe output "
-                      f"{float((again - t_enc).abs().max()):.4f}")
-                with torch.autocast("cpu", dtype=torch.bfloat16):
-                    bf, _ = model.encoder(audio_signal=feats, length=flen)
-                print(f"[diag] bf16-autocast encoder vs transcribe output: {float((bf.float() - t_enc).abs().max()):.4f}")
         pristine_encoded[stem] = enc[0, :, : int(elen[0])].numpy().astype(np.float32)
         transcripts[stem] = {"rnnt": getattr(r, "text", r), "with_danda": f}
     (ref / "transcripts.json").write_text(json.dumps(transcripts, indent=2, ensure_ascii=False))
