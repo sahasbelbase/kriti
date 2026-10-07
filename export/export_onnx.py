@@ -109,6 +109,50 @@ def export_graphs(model, out: Path) -> dict:
     return {"pred_rnn_layers": layers, "pred_hidden": hidden, "encoder_dim": enc_dim, "n_mels": n_mels}
 
 
+def torch_diagnostics(model, kriti, tokens, paths, transcripts, pristine_encoded) -> dict:
+    """Run our decoding loop on the original PyTorch modules, and Kriti's own danda head."""
+    import numpy as np
+    import torch
+
+    from kriti.model import encoder_features, logistic_probability
+
+    _, dec, joint = build_wrappers(model)
+    blank = len(tokens)
+    max_symbols = int(((model.cfg.get("decoding") or {}).get("greedy") or {}).get("max_symbols") or 10)
+    layers, hidden = int(model.decoder.pred_rnn_layers), int(model.decoder.pred_hidden)
+    head_feats = encoder_features(model, paths, "cpu", batch_size=1)
+    out = {"max_symbols": max_symbols, "clips": {}}
+    for path, vec in zip(paths, head_feats):
+        stem = Path(path).stem
+        enc = torch.from_numpy(pristine_encoded[stem])
+        h = torch.zeros(layers, 1, hidden)
+        c = torch.zeros(layers, 1, hidden)
+        with torch.no_grad():
+            g, h, c = dec(torch.tensor([[blank]]), h, c)
+            hyp = []
+            for t in range(enc.shape[1]):
+                f = enc[:, t][None, None, :]
+                for _ in range(max_symbols):
+                    k = int(joint(f, g).argmax())
+                    if k == blank:
+                        break
+                    hyp.append(k)
+                    g, h, c = dec(torch.tensor([[k]]), h, c)
+        text = " ".join("".join(tokens[i] for i in hyp).replace("\u2581", " ").split())
+        e = pristine_encoded[stem]
+        ours = np.concatenate([e.mean(axis=1), np.sqrt(((e - e.mean(axis=1, keepdims=True)) ** 2).mean(axis=1))])
+        head = kriti.head
+        out["clips"][stem] = {
+            "torch_greedy_matches_nemo": text == transcripts[stem]["rnnt"],
+            "torch_greedy": text,
+            "danda_prob_kriti": logistic_probability(vec, head["coefficients"], head["intercept"]),
+            "danda_prob_ours_from_encoder": logistic_probability(ours.tolist(), head["coefficients"], head["intercept"]),
+            "head_feature_max_abs_diff": float(np.abs(np.asarray(vec) - ours).max()),
+            "threshold": head["threshold"],
+        }
+    return out
+
+
 def quantize(out: Path) -> None:
     from onnxruntime.quantization import QuantType, quantize_dynamic
 
@@ -158,11 +202,9 @@ def main() -> int:
     (out / "tokens.json").write_text(json.dumps(tokens, ensure_ascii=False))
     shutil.copy(a.head, out / "punctuation_head.json")
 
-    dims = export_graphs(model, out)
-    quantize(out)
-
-    # NeMo reference outputs
+    # NeMo reference outputs, taken from the untouched model (export prep can alter modules)
     transcripts = {}
+    pristine_encoded = {}
     paths = [str(p) for p in a.clips]
     raw = model.transcribe(paths, batch_size=1, logprobs=False, language_id="ne")
     if isinstance(raw, tuple):
@@ -177,8 +219,32 @@ def main() -> int:
             feats, flen = model.preprocessor(input_signal=torch.from_numpy(audio)[None],
                                              length=torch.tensor([len(audio)]))
         np.save(ref / f"{stem}.feats.npy", feats[0, :, : int(flen[0])].numpy().astype(np.float32))
+        with torch.no_grad():
+            enc, elen = model.encoder(audio_signal=feats, length=flen)
+        pristine_encoded[stem] = enc[0, :, : int(elen[0])].numpy().astype(np.float32)
         transcripts[stem] = {"rnnt": getattr(r, "text", r), "with_danda": f}
     (ref / "transcripts.json").write_text(json.dumps(transcripts, indent=2, ensure_ascii=False))
+
+    diagnostics = torch_diagnostics(model, kriti, tokens, paths, transcripts, pristine_encoded)
+    print(json.dumps({"diagnostics_before_export": diagnostics}, indent=2, ensure_ascii=False))
+
+    dims = export_graphs(model, out)
+    quantize(out)
+
+    import onnxruntime as ort
+
+    sess = ort.InferenceSession(str(out / "encoder.onnx"), providers=["CPUExecutionProvider"])
+    enc_diff = {}
+    for stem in transcripts:
+        f = np.load(ref / f"{stem}.feats.npy")
+        e, el = sess.run(None, {"features": f[None], "length": np.array([f.shape[1]], dtype=np.int64)})
+        e = e[0, :, : int(el[0])]
+        p = pristine_encoded[stem]
+        n = min(e.shape[1], p.shape[1])
+        enc_diff[stem] = {"onnx_steps": int(e.shape[1]), "torch_steps": int(p.shape[1]),
+                          "max_abs_diff": float(np.abs(e[:, :n] - p[:, :n]).max())}
+    diagnostics["onnx_encoder_vs_torch"] = enc_diff
+    print(json.dumps({"onnx_encoder_vs_torch": enc_diff}, indent=2))
 
     cfg = OmegaConf.to_container(model.cfg, resolve=True)
     model_config = {"preprocessor": cfg["preprocessor"], "decoding": cfg.get("decoding"), **dims}
@@ -201,7 +267,7 @@ def main() -> int:
     model_config["stft_pad_mode"] = best_mode
     (out / "model_config.json").write_text(json.dumps(model_config, indent=2, ensure_ascii=False, default=str))
 
-    parity = {"feature_max_abs_diff": feat_diff, "stft_pad_mode": best_mode, "runs": {}}
+    parity = {"feature_max_abs_diff": feat_diff, "stft_pad_mode": best_mode, "diagnostics": diagnostics, "runs": {}}
     for quantized in (False, True):
         rt = KritiOnnx(out, quantized=quantized)
         label = "int8" if quantized else "fp32"
